@@ -31,6 +31,7 @@ latestVersion     0.11.0
 status            behind
 releasesBehind    11
 missedReleases    v0.11.0, v0.10.2, v0.10.1, v0.10.0, v0.9.6, ...
+truncated         false
 ```
 
 It reports; it does not act. Pair it with whatever pins your image — the point

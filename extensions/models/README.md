@@ -72,6 +72,7 @@ Writes one `drift` resource named `drift-<host>-<port>`:
 | `status` | `current`, `behind`, or `ahead` |
 | `releasesBehind` | How many published releases are newer |
 | `missedReleases` | Which ones, newest first — the changelog you have not read |
+| `truncated` | True when the counts above are a lower bound rather than a total |
 | `runningVersion` | What the instance reports |
 | `latestVersion` | Newest upstream release, normalised (no leading `v`) |
 | `latestPublishedAt` | When that release was published |
@@ -79,6 +80,14 @@ Writes one `drift` resource named `drift-<host>-<port>`:
 
 `ahead` is a normal state, not an error: a `:main` build reports a version
 newer than any published tag.
+
+`truncated` exists because only one page of 100 releases is fetched, and repos
+accumulate more than that — open-webui has 167. Walking every page would burn
+the unauthenticated 60/hour budget to answer a question the first page almost
+always settles. So the shortcut is taken and then declared: if the page fills
+up while every release on it is still newer than what you are running, there
+are more you never saw, `truncated` is true, and `releasesBehind` is a floor.
+`behind` and `latestVersion` are correct either way.
 
 ## Configuration
 
@@ -111,7 +120,8 @@ itself.
 
 **An unparseable running version throws.** Reporting `current` because the
 comparison could not be made is the failure this model exists to prevent. The
-same applies when no release tag parses at all.
+same applies when no release tag parses at all. In the same spirit, a capped
+release page is reported as `truncated` rather than passed off as a total.
 
 ## Development
 

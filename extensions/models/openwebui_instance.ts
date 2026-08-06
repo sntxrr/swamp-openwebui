@@ -94,10 +94,13 @@ const DriftSchema = z.object({
     "True when a newer upstream release exists. The single field to alert on.",
   ),
   releasesBehind: z.number().int().describe(
-    "How many published releases are newer than the running version",
+    "How many published releases are newer than the running version. A lower bound when `truncated` is true.",
   ),
   missedReleases: z.array(z.string()).describe(
     "Every release newer than the running version, newest first. This is the changelog you have not read.",
+  ),
+  truncated: z.boolean().describe(
+    "True when the release page filled up before reaching the running version, so `releasesBehind` and `missedReleases` are incomplete. False means the counts are exact.",
   ),
   checkedAt: z.string(),
 });
@@ -240,6 +243,18 @@ type OpenWebUIConfig = {
 };
 
 /**
+ * Trim an error response body to something loggable.
+ *
+ * An HTML error page or a long JSON blob in an exception message buries the
+ * status code that actually identifies the problem.
+ */
+function summarise(text: string, max = 200): string {
+  const flat = text.replace(/\s+/g, " ").trim();
+  if (flat === "") return "";
+  return flat.length <= max ? flat : `${flat.slice(0, max)}…`;
+}
+
+/**
  * Read `/api/config` from the instance.
  *
  * This endpoint answers before login, which is what lets the whole model run
@@ -266,8 +281,13 @@ async function readConfig(
   }
 
   if (!res.ok) {
+    // Read the body rather than discarding it: it is the difference between
+    // "something went wrong" and a usable error, and leaving it unconsumed
+    // holds the connection open.
     throw new Error(
-      `OpenWebUI GET ${url} failed: ${res.status} ${res.statusText}`,
+      `OpenWebUI GET ${url} failed: ${res.status} ${res.statusText} ${
+        summarise(await res.text())
+      }`,
     );
   }
 
@@ -292,6 +312,18 @@ type GitHubRelease = {
 };
 
 /**
+ * Releases fetched per call.
+ *
+ * Deliberately one page, not a full walk: repos accumulate hundreds of
+ * releases (open-webui has 167) and paginating them all would burn the
+ * unauthenticated 60/hour budget several requests at a time to answer a
+ * question the first page almost always settles. The cost of the shortcut is
+ * that counts can be a lower bound, which is why `truncated` exists rather
+ * than being left for the caller to guess.
+ */
+const PER_PAGE = 100;
+
+/**
  * List published releases for the configured repo, newest first.
  *
  * Drafts are always dropped; prereleases follow `includePrereleases`.
@@ -302,9 +334,9 @@ type GitHubRelease = {
  */
 async function listReleases(
   globalArgs: GlobalArgs,
-): Promise<GitHubRelease[]> {
+): Promise<{ releases: GitHubRelease[]; capped: boolean }> {
   const url =
-    `https://api.github.com/repos/${globalArgs.githubRepo}/releases?per_page=100`;
+    `https://api.github.com/repos/${globalArgs.githubRepo}/releases?per_page=${PER_PAGE}`;
 
   const headers: Record<string, string> = {
     Accept: "application/vnd.github+json",
@@ -335,6 +367,7 @@ async function listReleases(
       const resetAt = reset
         ? new Date(parseInt(reset, 10) * 1000).toISOString()
         : "unknown";
+      await res.body?.cancel();
       throw new Error(
         `GitHub API rate limit exhausted (resets ${resetAt}). ` +
           `Unauthenticated requests are capped at 60/hour per IP — ` +
@@ -344,6 +377,7 @@ async function listReleases(
   }
 
   if (res.status === 404) {
+    await res.body?.cancel();
     throw new Error(
       `GitHub repo "${globalArgs.githubRepo}" not found (404). Check githubRepo.`,
     );
@@ -351,14 +385,23 @@ async function listReleases(
 
   if (!res.ok) {
     throw new Error(
-      `GitHub GET ${url} failed: ${res.status} ${res.statusText}`,
+      `GitHub GET ${url} failed: ${res.status} ${res.statusText} ${
+        summarise(await res.text())
+      }`,
     );
   }
 
   const all = await res.json() as GitHubRelease[];
-  return all.filter((r) =>
-    !r.draft && (globalArgs.includePrereleases || !r.prerelease)
-  );
+
+  // Capped is measured on the RAW page, before filtering: a page of 100 that
+  // filters down to 40 still means there is a page 2. open-webui alone has 167
+  // releases, so this is the normal case, not a corner one.
+  return {
+    releases: all.filter((r) =>
+      !r.draft && (globalArgs.includePrereleases || !r.prerelease)
+    ),
+    capped: all.length >= PER_PAGE,
+  };
 }
 
 /**
@@ -373,11 +416,13 @@ async function listReleases(
 export function computeDrift(
   runningVersion: string,
   releases: { tag: string; publishedAt: string | null }[],
+  capped = false,
 ): {
   status: "current" | "behind" | "ahead";
   behind: boolean;
   releasesBehind: number;
   missedReleases: string[];
+  truncated: boolean;
   latestVersion: string;
   latestPublishedAt: string | null;
 } {
@@ -401,14 +446,22 @@ export function computeDrift(
   }
 
   const newest = parsed[0];
+  const oldest = parsed[parsed.length - 1];
   const missed = parsed.filter((r) => compareVersions(r.parsed, running) > 0);
   const cmp = compareVersions(running, newest.parsed);
+
+  // The counts are exact only if the fetched window reaches back past the
+  // running version. If the page filled up while every release on it is still
+  // newer than what is running, there are older-but-still-newer releases we
+  // never saw, and `releasesBehind` is a floor rather than a total.
+  const truncated = capped && compareVersions(oldest.parsed, running) > 0;
 
   return {
     status: cmp === 0 ? "current" : cmp < 0 ? "behind" : "ahead",
     behind: missed.length > 0,
     releasesBehind: missed.length,
     missedReleases: missed.map((r) => r.tag),
+    truncated,
     latestVersion: normaliseTag(newest.tag),
     latestPublishedAt: newest.publishedAt,
   };
@@ -464,6 +517,10 @@ export const model = {
       arguments: z.object({}),
       execute: async (_args: Record<never, never>, context: Context) => {
         const { globalArgs, logger } = context;
+        logger.info("Reading OpenWebUI config from {url}", {
+          url: globalArgs.baseUrl,
+        });
+
         const config = await readConfig(globalArgs);
         const features = config.features as Record<string, unknown> | undefined;
 
@@ -507,11 +564,15 @@ export const model = {
       arguments: z.object({}),
       execute: async (_args: Record<never, never>, context: Context) => {
         const { globalArgs, logger } = context;
+        logger.info(
+          "Checking {url} for drift against {repo} releases",
+          { url: globalArgs.baseUrl, repo: globalArgs.githubRepo },
+        );
 
         const config = await readConfig(globalArgs);
         const runningVersion = config.version as string;
 
-        const releases = await listReleases(globalArgs);
+        const { releases, capped } = await listReleases(globalArgs);
         logger.info(
           "Comparing {running} against {count} releases from {repo}",
           {
@@ -527,7 +588,16 @@ export const model = {
             tag: r.tag_name,
             publishedAt: r.published_at,
           })),
+          capped,
         );
+
+        if (result.truncated) {
+          logger.warn(
+            "Release list was capped at {perPage} before reaching {running} — " +
+              "releasesBehind is a lower bound, not a total",
+            { perPage: PER_PAGE, running: runningVersion },
+          );
+        }
 
         if (result.behind) {
           logger.warn(
@@ -558,6 +628,7 @@ export const model = {
             behind: result.behind,
             releasesBehind: result.releasesBehind,
             missedReleases: result.missedReleases,
+            truncated: result.truncated,
             checkedAt: new Date().toISOString(),
           },
         );

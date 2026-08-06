@@ -1,4 +1,5 @@
 import { assertEquals, assertRejects, assertThrows } from "jsr:@std/assert@1";
+import { createModelTestContext } from "jsr:@swamp-club/swamp-testing";
 import {
   compareVersions,
   computeDrift,
@@ -177,6 +178,38 @@ Deno.test("computeDrift: no parseable releases throws rather than reporting curr
   );
 });
 
+/* ------------------------------------------------------------------ *
+ * Truncation
+ *
+ * Only one page of releases is fetched. Repos accumulate hundreds
+ * (open-webui has 167 against a 100-item page), so a count that silently
+ * stops at the page boundary would understate how far behind an old
+ * instance is — while still looking like a precise number.
+ * ------------------------------------------------------------------ */
+
+Deno.test("computeDrift: not truncated when the page was not full", () => {
+  const d = computeDrift("0.8.12", REAL_RELEASES, false);
+  assertEquals(d.truncated, false);
+  assertEquals(d.releasesBehind, 11);
+});
+
+Deno.test("computeDrift: a full page that reaches past the running version is exact", () => {
+  // The page filled up, but its oldest entry (0.8.11) is older than what is
+  // running (0.8.12) — so every release newer than running was on the page.
+  const d = computeDrift("0.8.12", REAL_RELEASES, true);
+  assertEquals(d.truncated, false);
+  assertEquals(d.releasesBehind, 11);
+});
+
+Deno.test("computeDrift: a full page that never reaches the running version is truncated", () => {
+  // Every release on the page is newer than 0.5.0, so there are certainly
+  // more we never saw. The count is a floor, and must say so.
+  const d = computeDrift("0.5.0", REAL_RELEASES, true);
+  assertEquals(d.truncated, true);
+  assertEquals(d.behind, true);
+  assertEquals(d.releasesBehind, REAL_RELEASES.length);
+});
+
 Deno.test("computeDrift: unparseable tags are skipped, not fatal, when others parse", () => {
   const d = computeDrift("0.8.12", [
     { tag: "nightly", publishedAt: null },
@@ -235,6 +268,19 @@ Deno.test("different instances get different resource names", () => {
  * throws on mismatch — the stub has to be able to fail.
  * ------------------------------------------------------------------ */
 
+type SyncContext = Parameters<typeof model.methods.sync.execute>[1];
+
+/**
+ * Build a method context on the official harness, with schema validation
+ * layered on top of its `writeResource`.
+ *
+ * The harness context alone is a recorder: probed directly, it accepts a spec
+ * name that does not exist and a data object of unrelated junk, and returns a
+ * successful handle. Every schema bug is invisible under it. So the harness is
+ * used for context construction — staying consistent with the other extensions
+ * here — and the write path is wrapped to `parse` against the model's own
+ * declared zod schema first, so the stub can actually fail.
+ */
 function makeContext(globalArgs: {
   baseUrl: string;
   githubRepo?: string;
@@ -243,32 +289,36 @@ function makeContext(globalArgs: {
   timeoutMs?: number;
 }) {
   const written: { spec: string; name: string; data: Record<string, unknown> }[] = [];
-  return {
-    written,
-    context: {
-      globalArgs: {
-        githubRepo: "open-webui/open-webui",
-        includePrereleases: false,
-        timeoutMs: 10000,
-        ...globalArgs,
-      },
-      logger: { info: () => {}, warn: () => {} },
-      // deno-lint-ignore require-await
-      writeResource: async (
-        spec: string,
-        name: string,
-        data: Record<string, unknown>,
-      ) => {
-        const schema =
-          (model.resources as Record<string, { schema: { parse: (d: unknown) => unknown } }>)[spec]
-            ?.schema;
-        if (!schema) throw new Error(`No such resource spec: ${spec}`);
-        schema.parse(data); // throws on any shape the declared schema rejects
-        written.push({ spec, name, data });
-        return { name };
-      },
+
+  const ctx = createModelTestContext({
+    globalArgs: {
+      githubRepo: "open-webui/open-webui",
+      includePrereleases: false,
+      timeoutMs: 10000,
+      ...globalArgs,
     },
-  };
+    methodName: "sync",
+  });
+
+  const inner = ctx.context as unknown as SyncContext;
+  const context = {
+    ...inner,
+    writeResource: async (
+      spec: string,
+      name: string,
+      data: Record<string, unknown>,
+    ) => {
+      const schema =
+        (model.resources as Record<string, { schema: { parse: (d: unknown) => unknown } }>)[spec]
+          ?.schema;
+      if (!schema) throw new Error(`No such resource spec: ${spec}`);
+      schema.parse(data); // throws on any shape the declared schema rejects
+      written.push({ spec, name, data });
+      return await inner.writeResource(spec, name, data);
+    },
+  } as unknown as SyncContext;
+
+  return { written, context };
 }
 
 const CONFIG_BODY = {
@@ -359,6 +409,55 @@ Deno.test("drift writes a drift resource that satisfies the declared schema", as
     assertEquals(written[0].data.releasesBehind, 11);
     assertEquals(written[0].data.latestVersion, "0.11.0");
     assertEquals(written[0].data.status, "behind");
+    // 13 releases returned against a 100-item page: not capped, so exact.
+    assertEquals(written[0].data.truncated, false);
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("drift marks a capped release page as truncated end to end", async () => {
+  // A full page of 100 releases, every one newer than the running 0.5.0 —
+  // spanning v0.6.0 to v0.15.9, so the page never reaches back to 0.5.0.
+  const fullPage = Array.from({ length: 100 }, (_, i) => ({
+    tag_name: `v0.${6 + Math.floor(i / 10)}.${i % 10}`,
+    draft: false,
+    prerelease: false,
+    published_at: null,
+  }));
+  const restore = stubFetch((url) =>
+    url.includes("api.github.com")
+      ? { body: fullPage }
+      : { body: { ...CONFIG_BODY, version: "0.5.0" } }
+  );
+  try {
+    const { context, written } = makeContext({ baseUrl: "http://localhost:3000" });
+    await model.methods.drift.execute({}, context);
+    assertEquals(written[0].data.truncated, true);
+    assertEquals(written[0].data.behind, true);
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("drift measures the page cap before filtering, not after", async () => {
+  // A full page of 100 that filters down to 2 usable releases still means
+  // there is a page 2. Measuring after the filter would call this exact.
+  const fullPage = Array.from({ length: 100 }, (_, i) => ({
+    tag_name: `v0.9.${i}`,
+    draft: false,
+    prerelease: i >= 2, // all but two filtered out
+    published_at: null,
+  }));
+  const restore = stubFetch((url) =>
+    url.includes("api.github.com")
+      ? { body: fullPage }
+      : { body: { ...CONFIG_BODY, version: "0.5.0" } }
+  );
+  try {
+    const { context, written } = makeContext({ baseUrl: "http://localhost:3000" });
+    await model.methods.drift.execute({}, context);
+    assertEquals(written[0].data.truncated, true);
   } finally {
     restore();
   }
