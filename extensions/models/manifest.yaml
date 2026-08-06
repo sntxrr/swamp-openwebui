@@ -1,0 +1,22 @@
+manifestVersion: 1
+
+name: "@sntxrr/openwebui"
+version: "2026.08.06.1"
+description: "Read a running OpenWebUI instance and report how far its version has drifted behind upstream. Both methods are strictly read-only — this extension never upgrades the instance, edits its settings, manages users, or touches the container; it tells you an update is available and stops there. `sync` records what the instance reports about itself: version plus the feature flags that decide what automation can reach it, including `enable_api_keys`, which when false blocks every token-authenticated integration and cannot be worked around with any credential. `drift` compares the running version against the repo's published GitHub releases and reports status (`current`/`behind`/`ahead`), how many releases were missed, and which ones. Needs no credentials at all: both endpoints it uses answer before login. Versions are compared numerically because OpenWebUI's break lexical ordering in both directions — `0.8.12` sorts above `0.11.0` and below `0.8.9` as strings — so a string compare reports an instance eleven releases behind as up to date. An exhausted GitHub rate limit, a missing repo, and an unparseable running version are all raised as errors rather than folded into a reassuring `current`."
+repository: "https://github.com/sntxrr/swamp-openwebui"
+
+models:
+  - openwebui_instance.ts
+
+additionalFiles:
+  - README.md
+  - LICENSE.md
+
+labels:
+  - openwebui
+  - ollama
+  - llm
+  - drift
+  - version
+  - homelab
+  - self-hosted
