@@ -371,6 +371,38 @@ Deno.test("sync writes an instance resource that satisfies the declared schema",
   }
 });
 
+Deno.test("sync reports an undisclosed enable_api_keys as null, never false", async () => {
+  // OpenWebUI v0.9.6 removed this flag from the unauthenticated /api/config
+  // response, so on any current instance it is simply absent. Collapsing that
+  // to `false` would assert "API keys are disabled" on no evidence.
+  const { enable_api_keys: _omitted, ...withoutFlag } = CONFIG_BODY.features;
+  const restore = stubFetch(() => ({
+    body: { ...CONFIG_BODY, version: "0.11.0", features: withoutFlag },
+  }));
+  try {
+    const { context, written } = makeContext({ baseUrl: "http://localhost:3000" });
+    await model.methods.sync.execute({}, context);
+    assertEquals(written[0].data.apiKeysEnabled, null);
+    // The flags that ARE still disclosed must keep their real values.
+    assertEquals(written[0].data.authEnabled, true);
+    assertEquals(written[0].data.websocketEnabled, true);
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("sync still distinguishes an explicit false from an absent flag", async () => {
+  const restore = stubFetch(() => ({ body: CONFIG_BODY }));
+  try {
+    const { context, written } = makeContext({ baseUrl: "http://localhost:3000" });
+    await model.methods.sync.execute({}, context);
+    // CONFIG_BODY sets it explicitly false — that must survive as false, not null.
+    assertEquals(written[0].data.apiKeysEnabled, false);
+  } finally {
+    restore();
+  }
+});
+
 Deno.test("sync rejects a response with no version rather than storing a null", async () => {
   const restore = stubFetch(() => ({ body: { name: "Not OpenWebUI" } }));
   try {

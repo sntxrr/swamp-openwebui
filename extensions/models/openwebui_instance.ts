@@ -66,8 +66,8 @@ const InstanceSchema = z.object({
   authEnabled: z.boolean().describe(
     "Whether the instance requires a login at all",
   ),
-  apiKeysEnabled: z.boolean().describe(
-    "Whether API keys can be issued. False means no token-authenticated automation is possible against this instance.",
+  apiKeysEnabled: z.boolean().nullable().describe(
+    "Whether API keys can be issued. False means no token-authenticated automation is possible. NULL means the instance did not say — OpenWebUI stopped disclosing this flag to unauthenticated callers in v0.9.6, and absent is not the same as off.",
   ),
   signupEnabled: z.boolean().describe(
     "Whether new accounts can self-register",
@@ -478,6 +478,25 @@ function flag(features: Record<string, unknown> | undefined, key: string) {
 }
 
 /**
+ * Read a feature flag that may not be reported at all.
+ *
+ * Returns `null` when the key is absent rather than collapsing it to `false`.
+ * OpenWebUI v0.9.6 removed several flags from the unauthenticated
+ * `/api/config` response — `enable_api_keys` among them — so on a current
+ * instance the flag is simply not there. Reporting that as `false` would state
+ * as fact ("API keys are disabled") something the instance never said, and the
+ * conclusion drawn from it ("no automation can reach this") could be exactly
+ * backwards.
+ */
+function tristateFlag(
+  features: Record<string, unknown> | undefined,
+  key: string,
+): boolean | null {
+  const v = features?.[key];
+  return typeof v === "boolean" ? v : null;
+}
+
+/**
  * Model type `@sntxrr/openwebui/instance`.
  *
  * @example
@@ -492,7 +511,7 @@ export const model = {
   type: "@sntxrr/openwebui/instance",
   description:
     "Read a running OpenWebUI instance and report how far its version has drifted behind upstream releases. Read-only, and needs no credentials — both endpoints it uses answer before login.",
-  version: "2026.08.06.1",
+  version: "2026.08.07.1",
   globalArguments: GlobalArgsSchema,
   resources: {
     instance: {
@@ -529,12 +548,19 @@ export const model = {
           version: config.version,
         });
 
-        const apiKeysEnabled = flag(features, "enable_api_keys");
-        if (!apiKeysEnabled) {
+        const apiKeysEnabled = tristateFlag(features, "enable_api_keys");
+        if (apiKeysEnabled === false) {
           // Worth saying out loud: this is the flag that blocks every
           // token-authenticated integration, and no credential works around it.
           logger.warn(
             "API keys are disabled on {url} — no token-authenticated automation can reach it",
+            { url: globalArgs.baseUrl },
+          );
+        } else if (apiKeysEnabled === null) {
+          // Not the same as disabled, and must not be reported as such.
+          logger.info(
+            "{url} does not disclose enable_api_keys to unauthenticated callers " +
+              "(v0.9.6+); whether API keys are available is unknown from here",
             { url: globalArgs.baseUrl },
           );
         }

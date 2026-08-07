@@ -26,6 +26,9 @@ than require a key it may be impossible to issue, this model stays on the side
 of the API that always answers and has `sync` report the flag, so you can see
 whether deeper automation is even possible before attempting it.
 
+Since v0.9.6 that flag is withheld from unauthenticated callers, so on a current
+instance `sync` reports it as `null` — unknown, not off.
+
 ## Methods
 
 ### `sync`
@@ -44,7 +47,7 @@ Writes one `instance` resource named `instance-<host>-<port>`:
 | `version` | Version the instance reports |
 | `name` | Instance display name |
 | `authEnabled` | Whether a login is required at all |
-| `apiKeysEnabled` | Whether API keys can be issued — false blocks all token-authenticated automation |
+| `apiKeysEnabled` | Whether API keys can be issued — `false` blocks all token-authenticated automation. **`null` means the instance did not say**: v0.9.6 stopped disclosing this flag to unauthenticated callers, and absent is not the same as off. |
 | `signupEnabled` | Whether new accounts can self-register |
 | `websocketEnabled` | Whether chat streams over a WebSocket |
 | `checkedAt` | When this reading was taken |
@@ -52,8 +55,10 @@ Writes one `instance` resource named `instance-<host>-<port>`:
 `websocketEnabled` is worth knowing before putting a forward-auth proxy in
 front of the instance, since chat streams over that socket.
 
-When `apiKeysEnabled` is false, `sync` also logs a warning — it is the single
-flag that decides whether any token-authenticated integration is possible.
+When `apiKeysEnabled` is `false`, `sync` logs a warning — it is the single flag
+that decides whether any token-authenticated integration is possible. When it is
+`null` it logs an *info* line instead, because "the instance declined to say" is
+not a problem, and reporting it as a problem would be its own kind of wrong.
 
 ### `drift`
 
@@ -130,8 +135,9 @@ release page is reported as `truncated` rather than passed off as a total.
 ~/.swamp/deno/deno test --allow-net extensions/models/openwebui_instance_test.ts
 ```
 
-25 tests, covering the version-ordering traps, the drift arithmetic against the
-real release list, resource-name collisions, and both error paths.
+32 tests, covering the version-ordering traps, the drift arithmetic against the
+real release list, truncation, resource-name collisions, the absent-vs-false
+distinction on withheld feature flags, and both error paths.
 `writeResource` is stubbed with the model's own declared zod schema rather than
 a recorder, so a resource that stops matching its schema fails the test instead
 of passing silently — verified by mutation, not assumed.
