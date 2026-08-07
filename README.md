@@ -46,6 +46,24 @@ swamp model create @sntxrr/openwebui/instance openwebui \
 swamp model @sntxrr/openwebui/instance method run drift openwebui
 ```
 
+## Where the implementation lives
+
+This repo is **extension source only** — the reusable artifact published to
+swamp club. It deliberately contains no model instances, no workflows and no
+operator state.
+
+The running implementation lives in a separate repo (`~/git/swamp-homelab`)
+which mounts this one upstream:
+
+```bash
+swamp extension source add ~/git/swamp-extensions/openwebui
+```
+
+That repo holds the `openwebui` model instance, the `openwebui-drift-watch`
+workflow and the datastore config — all of which reference instance names and a
+baseUrl that mean nothing to anyone else, and so have no business in a package
+other people install.
+
 ## Development
 
 ```bash
