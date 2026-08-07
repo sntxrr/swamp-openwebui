@@ -1,0 +1,144 @@
+id: b9440eb7-eca2-4133-977b-fa5c7f9d0f65
+name: "@sntxrr/openwebui-drift-watch"
+description: >-
+  Compare the running OpenWebUI instance against upstream's published releases,
+  raise an Apprise notification when it has fallen behind, and record what the
+  instance reports about itself.
+
+  A container left on a floating `:main` tag looks permanently up to date. The
+  tag is only re-resolved when something re-pulls it, so an instance started
+  once and left alone freezes at whatever version it happened to get. This one
+  sat on 0.8.12 while eleven releases went by. Nothing surfaces that: the UI
+  does not say "you are behind", and `/health` reports on the web process, not
+  on how old it is.
+
+  Read-only. Both methods used here (drift, sync) only read -- there is no
+  method in this extension that can upgrade anything, so this can report a
+  problem but never "fix" one behind your back.
+
+  Targets the instance DIRECTLY on localhost, never the
+  openwebui.np.oneill-dell.house vhost: that hostname is behind Authentik
+  forward-auth, which 302s a bearer-token API call, and the model would read
+  the redirect as a broken endpoint.
+
+  NOTE: deliberately has NO trigger. Unlike the unifi and tailscale watchers
+  this workflow needs no operator-specific input, so a trigger would be
+  *possible* -- but triggers only fire under `swamp serve`, and nothing serves
+  this repo. Cron invokes it instead:
+
+    swamp workflow run @sntxrr/openwebui-drift-watch --repo-dir <repo>
+tags: {}
+inputs:
+  properties:
+    notify:
+      type: boolean
+      description: >-
+        When false, detect drift but stay silent. For a manual run when you
+        already know the instance is behind and are about to bump it.
+      default: true
+jobs:
+  - name: check
+    description: Compare the running version against upstream's releases
+    steps:
+      - name: detect-drift
+        description: >-
+          Reads /api/config for the running version, then one page of the
+          repo's GitHub releases, and reports how far behind it is.
+
+          Fails loudly rather than guessing: an exhausted GitHub rate limit, a
+          missing repo, and an unparseable running version each throw instead of
+          being folded into a reassuring "current".
+        task:
+          type: model_method
+          modelIdOrName: openwebui
+          methodName: drift
+        dependsOn: []
+        weight: 0
+        allowFailure: false
+    dependsOn: []
+    weight: 0
+  - name: alert
+    description: Notify when the instance has fallen behind upstream
+    steps:
+      - name: notify-drift
+        description: >-
+          Gated by a step `guard` -- a CEL predicate evaluated before the step,
+          where TRUTHY MEANS SKIP. Read it as "skip when notification is off, or
+          when the instance is not behind".
+
+          `behind` is the right field to gate on, not `status`. `status` has
+          three values and one of them, `ahead`, is a perfectly normal state for
+          a :main build that has outrun the last published tag -- gating on
+          `status != "current"` would page every hour for that. `behind` is
+          false for both `current` and `ahead`.
+
+          The data name is `drift-localhost-3000`, derived from the model's
+          baseUrl host and port. If baseUrl ever changes, this reference and the
+          one in the body below must change with it -- they will not fail
+          loudly, they will just stop matching.
+        guard: >-
+          ${{ !inputs.notify ||
+          !data.latest('openwebui', 'drift-localhost-3000').attributes.behind }}
+        task:
+          type: model_method
+          modelIdOrName: apprise
+          methodName: notify
+          inputs:
+            title: 'OpenWebUI is behind upstream'
+            body: >-
+              ${{ "running=" + data.latest('openwebui', 'drift-localhost-3000').attributes.runningVersion
+              + " latest=" + data.latest('openwebui', 'drift-localhost-3000').attributes.latestVersion
+              + " behind=" + string(data.latest('openwebui', 'drift-localhost-3000').attributes.releasesBehind)
+              + " releases, published " + data.latest('openwebui', 'drift-localhost-3000').attributes.latestPublishedAt
+              + " (count truncated=" + string(data.latest('openwebui', 'drift-localhost-3000').attributes.truncated)
+              + "). Bump the pin in ~/git/np-openwebui/docker-compose.yml, then make backup && make deploy." }}
+            type: warning
+            format: markdown
+        dependsOn: []
+        weight: 0
+        # An undeliverable notification must not turn a successful drift check
+        # into a failed run -- the drift result is already durable in the data
+        # store. Matches the homelab convention that notify failures are
+        # non-fatal.
+        #
+        # This cuts both ways, and has bitten the unifi watcher: a broken CEL
+        # expression here shows up as a GREEN run. The cron wrapper therefore
+        # greps for a failed notify-drift step and treats it as a watcher
+        # failure. If you edit the expressions above, check
+        # `swamp workflow history get @sntxrr/openwebui-drift-watch` rather
+        # than trusting the run status.
+        allowFailure: true
+    dependsOn:
+      - job: check
+        condition:
+          type: succeeded
+    weight: 1
+  - name: snapshot
+    description: Record what the instance reports about itself
+    steps:
+      - name: record-instance
+        description: >-
+          Version plus the feature flags that decide what automation can reach
+          this instance -- notably enable_api_keys, which when false blocks
+          every token-authenticated integration and cannot be worked around
+          with any credential.
+
+          Writes a different spec and a different instance name than `drift`
+          (instance-localhost-3000 vs drift-localhost-3000), so the two cannot
+          collide in the flat writeResource namespace and the ordering of these
+          jobs is not load-bearing.
+        task:
+          type: model_method
+          modelIdOrName: openwebui
+          methodName: sync
+        dependsOn: []
+        weight: 0
+        allowFailure: false
+    # Runs last only because nothing depends on it, so there is no reason to
+    # make the alert wait behind it.
+    dependsOn:
+      - job: alert
+        condition:
+          type: completed
+    weight: 2
+version: 1
