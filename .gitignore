@@ -19,3 +19,7 @@
 # them -- only manifest-declared files ship -- but this repo is public, so keep
 # them out of git too.
 models/**/*.yaml
+
+# .swamp.yaml is operator state (datastore, repoId). Extension repos track only
+# the .example -- the running implementation lives in ~/git/swamp-homelab.
+.swamp.yaml
